@@ -49,6 +49,7 @@
 
 #include "../font_driver.h"
 #include "../video_driver.h"
+#include "../../pacing_trace.h"
 #include "../gfx_instrument.h"
 #ifdef HAVE_THREADS
 #include "../video_thread_wrapper.h"
@@ -9249,10 +9250,16 @@ static bool vulkan_present_retained_once(vk_t *vk)
    slock_unlock(vk->context->queue_lock);
 #endif
 
+   ra_pacing_trace_mark(RA_PT_VK_FENCE_BEGIN, 0);
    vulkan_await_frame_before_present(vk, frame_index);
+   ra_pacing_trace_mark(RA_PT_VK_FENCE_END, 0);
 
    if (vk->ctx_driver->swap_buffers)
+   {
+      ra_pacing_trace_mark(RA_PT_VK_SWAP_BEGIN, 0);
       vk->ctx_driver->swap_buffers(vk->ctx_data);
+      ra_pacing_trace_mark(RA_PT_VK_SWAP_END, 0);
+   }
 
    return true;
 }
@@ -13465,9 +13472,13 @@ static bool vulkan_frame(void *data, const void *frame,
       retro_perf_tick_t c0      = cpu_features_get_perf_counter();
       retro_perf_tick_t c1, c2;
       retro_time_t      total;
+      ra_pacing_trace_mark(RA_PT_VK_FENCE_BEGIN, 0);
       vulkan_await_frame_before_present(vk, frame_index);
+      ra_pacing_trace_mark(RA_PT_VK_FENCE_END, 0);
       c1 = cpu_features_get_perf_counter();
+      ra_pacing_trace_mark(RA_PT_VK_SWAP_BEGIN, 0);
       vk->ctx_driver->swap_buffers(vk->ctx_data);
+      ra_pacing_trace_mark(RA_PT_VK_SWAP_END, 0);
       c2    = cpu_features_get_perf_counter();
       total = cpu_features_get_time_usec() - sync_at;
       if (c2 > c0 && total > 0)

@@ -45,6 +45,7 @@
 #include "../../driver.h"
 #include "../../dynamic.h"
 #include "../../retroarch.h"
+#include "../../pacing_trace.h"
 #include "../../verbosity.h"
 #include "../../frontend/frontend_driver.h"
 
@@ -140,9 +141,15 @@ static void gfx_ctx_w_vk_swap_buffers(void *data)
        * throttles that path itself. Nothing to present and nothing to
        * wait for here. */
       if (vulkan_has_swapchain(&win32_vk))
+      {
+         ra_pacing_trace_mark(RA_PT_VK_PRESENT_BEGIN, 0);
          vulkan_present(&win32_vk, win32_vk.context.current_swapchain_index);
+         ra_pacing_trace_mark(RA_PT_VK_PRESENT_END, 0);
+      }
    }
+   ra_pacing_trace_mark(RA_PT_VK_ACQUIRE_BEGIN, 0);
    vulkan_acquire_next_image(&win32_vk);
+   ra_pacing_trace_mark(RA_PT_VK_ACQUIRE_END, 0);
 }
 
 static bool gfx_ctx_w_vk_set_resize(void *data, unsigned dims)

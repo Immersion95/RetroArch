@@ -32,6 +32,7 @@
 #endif
 
 #include "audio_driver.h"
+#include "../pacing_trace.h"
 #include "../defaults.h"
 #include "audio_stretch.h"
 #include "audio_speed_lpf.h"
@@ -2824,7 +2825,10 @@ static ssize_t audio_driver_dev_write(audio_driver_state_t *audio_st,
       const audio_driver_t *audio, const void *buf, size_t bytes,
       bool wait_room)
 {
-   ssize_t w = audio->write(audio_st->context_audio_data, buf, bytes);
+   ssize_t w;
+   ra_pacing_trace_mark(RA_PT_AUDIO_DEV_WRITE_BEGIN, (int64_t)bytes);
+   w = audio->write(audio_st->context_audio_data, buf, bytes);
+   ra_pacing_trace_mark(RA_PT_AUDIO_DEV_WRITE_END, (int64_t)w);
    if (     wait_room
          && w >= 0 && (size_t)w < bytes
          && (AUDIO_FLAGS_GET(audio_st) & AUDIO_FLAG_NONBLOCK)
@@ -2836,8 +2840,11 @@ static ssize_t audio_driver_dev_write(audio_driver_state_t *audio_st,
    {
       ssize_t rest;
       audio->set_nonblock_state(audio_st->context_audio_data, false);
+      ra_pacing_trace_mark(RA_PT_AUDIO_DEV_WRITE_BEGIN,
+            (int64_t)(bytes - (size_t)w));
       rest = audio->write(audio_st->context_audio_data,
             (const uint8_t*)buf + w, bytes - (size_t)w);
+      ra_pacing_trace_mark(RA_PT_AUDIO_DEV_WRITE_END, (int64_t)rest);
       audio->set_nonblock_state(audio_st->context_audio_data,
             (AUDIO_FLAGS_GET(audio_st) & AUDIO_FLAG_NONBLOCK) != 0);
       if (rest > 0)
@@ -6376,7 +6383,9 @@ static void audio_driver_pipeline_retry(audio_driver_state_t *audio_st)
       if (!ready) return;
       if (bytes > ready) bytes = ready;
       audio_driver_state_lock();
+      ra_pacing_trace_mark(RA_PT_AUDIO_DEV_WRITE_BEGIN, (int64_t)bytes);
       written = audio->write(audio_st->context_audio_data, audio_st->pipe_pending, bytes);
+      ra_pacing_trace_mark(RA_PT_AUDIO_DEV_WRITE_END, (int64_t)written);
       if (written > 0 && (size_t)written <= bytes)
       {
          size_t fb = audio_driver_dev_frame_bytes(audio_st);
@@ -6807,6 +6816,7 @@ static void audio_driver_pipe_note_wait(audio_driver_state_t *st,
       retro_time_t began)
 {
    retro_time_t took = cpu_features_get_time_usec() - began;
+   ra_pacing_trace_mark(RA_PT_AUDIO_PIPE_WAIT_US, (int64_t)took);
    retro_atomic_fetch_add_size(&st->pipe_source_waits, 1);
    if (took > 0 && (size_t)took
          > retro_atomic_load_relaxed_size(&st->pipe_source_wait_max_us))

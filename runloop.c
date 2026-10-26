@@ -137,6 +137,7 @@ bool android_get_vfs_authorized_locations(
 
 #include "runtime_file.h"
 #include "runloop.h"
+#include "pacing_trace.h"
 #include "camera/camera_driver.h"
 #include "location_driver.h"
 #include "record/record_driver.h"
@@ -9683,6 +9684,138 @@ static void runloop_gpu_device_lost(runloop_state_t *runloop_st)
    command_event(CMD_EVENT_REINIT, &reinit_flags);
 }
 
+/* Win32 diagnostic-only recorder. QPC readings are sampled into a
+ * bounded, preallocated array, with no disk I/O or formatting during
+ * gameplay. Atomic slot claims permit off-main-thread present markers.
+ * A frame ID is a runloop iteration ID, not a guaranteed present ID
+ * when asynchronous video threading is enabled. */
+#if defined(_WIN32) && !defined(_XBOX) && !defined(__WINRT__)
+#define RA_PT_CAPACITY 262144L
+struct ra_pt_record
+{
+   LONGLONG tick;
+   LONGLONG value;
+   LONG frame;
+   DWORD thread;
+   unsigned short event;
+};
+static struct ra_pt_record *ra_pt_buffer;
+static volatile LONG ra_pt_state; /* 0=unknown, 1=off, 2=on, 3=initialising */
+static volatile LONG ra_pt_written;
+static volatile LONG ra_pt_frame;
+static LARGE_INTEGER ra_pt_freq;
+
+static const char *ra_pt_name(unsigned event)
+{
+   static const char *const names[] = {
+      "NONE", "ITER_BEGIN", "CORE_BEGIN", "CORE_END",
+      "AUDIO_FRAME_END_BEGIN", "AUDIO_FRAME_END_END", "VIDEO_BEGIN",
+      "FRAME_CALLBACK_BEGIN", "FRAME_CALLBACK_END", "VIDEO_END",
+      "DXGI_PRESENT_BEGIN", "DXGI_PRESENT_END", "VK_SWAP_BEGIN",
+      "VK_SWAP_END", "VK_FENCE_BEGIN", "VK_FENCE_END",
+      "ITER_AFTER_CORE", "PACE_FACTS", "PACE_SOURCES",
+      "CORE_HZ_MILLI", "TIMER_REQUEST_US", "TIMER_WAIT_BEGIN",
+      "TIMER_WAIT_END", "TIMER_SPIN_BEGIN", "TIMER_SPIN_END",
+      "FRAME_DELAY_BEGIN", "FRAME_DELAY_END", "DRIVER_WAIT_BEGIN",
+      "DRIVER_WAIT_END", "AUDIO_DEV_WRITE_BEGIN", "AUDIO_DEV_WRITE_END",
+      "AUDIO_PIPE_WAIT_US", "NOWINDOW", "VK_PRESENT_BEGIN",
+      "VK_PRESENT_END", "VK_ACQUIRE_BEGIN", "VK_ACQUIRE_END"
+   };
+   if (event < sizeof(names) / sizeof(names[0]))
+      return names[event];
+   return "UNKNOWN";
+}
+
+static void ra_pt_save(void)
+{
+   LONG i;
+   LONG written = InterlockedCompareExchange(&ra_pt_written, 0, 0);
+   const char *path = getenv("RA_PACING_TRACE_FILE");
+   FILE *fp = fopen((path && *path) ? path : "retroarch_pacing_trace.csv", "wb");
+   if (!fp)
+   {
+      fprintf(stderr, "[Pacing trace] Cannot write CSV: %s\n",
+            (path && *path) ? path : "retroarch_pacing_trace.csv");
+      return;
+   }
+   fprintf(fp, "# qpc_frequency_hz=%llu\n", (unsigned long long)ra_pt_freq.QuadPart);
+   fprintf(fp, "# buffer_capacity=%ld\n", RA_PT_CAPACITY);
+   fprintf(fp, "# events_lost=%ld\n", written > RA_PT_CAPACITY ? written - RA_PT_CAPACITY : 0);
+   fprintf(fp, "sequence,iteration,thread_id,event,qpc_ticks,value\n");
+   if (written > RA_PT_CAPACITY)
+      written = RA_PT_CAPACITY;
+   for (i = 0; i < written; ++i)
+   {
+      const struct ra_pt_record *r = &ra_pt_buffer[i];
+      if (r->tick)
+         fprintf(fp, "%ld,%ld,%lu,%s,%lld,%lld\n", i,
+               (long)r->frame, (unsigned long)r->thread,
+               ra_pt_name(r->event), (long long)r->tick,
+               (long long)r->value);
+   }
+   fclose(fp);
+   fprintf(stderr, "[Pacing trace] Wrote %ld events to %s\n", written,
+         (path && *path) ? path : "retroarch_pacing_trace.csv");
+   free(ra_pt_buffer);
+   ra_pt_buffer = NULL;
+}
+
+static bool ra_pt_is_enabled(void)
+{
+   LONG state = InterlockedCompareExchange(&ra_pt_state, 0, 0);
+   if (state == 2) return true;
+   if (state != 0) return false;
+   if (InterlockedCompareExchange(&ra_pt_state, 3, 0) == 0)
+   {
+      const char *env = getenv("RA_PACING_TRACE");
+      bool ok = (env && strcmp(env, "1") == 0);
+      if (ok)
+      {
+         ra_pt_buffer = (struct ra_pt_record *)calloc(RA_PT_CAPACITY,
+               sizeof(*ra_pt_buffer));
+         ok = ra_pt_buffer && QueryPerformanceFrequency(&ra_pt_freq)
+               && atexit(ra_pt_save) == 0;
+         if (!ok)
+         {
+            free(ra_pt_buffer);
+            ra_pt_buffer = NULL;
+         }
+      }
+      InterlockedExchange(&ra_pt_state, ok ? 2 : 1);
+      return ok;
+   }
+   return false;
+}
+
+void ra_pacing_trace_mark(enum ra_pacing_event event, int64_t value)
+{
+   LONG i;
+   LARGE_INTEGER tick;
+   struct ra_pt_record *r;
+   if (!ra_pt_is_enabled())
+      return;
+   QueryPerformanceCounter(&tick);
+   i = InterlockedIncrement(&ra_pt_written) - 1;
+   if (i >= RA_PT_CAPACITY)
+      return;
+   r         = &ra_pt_buffer[i];
+   r->event  = (unsigned short)event;
+   r->frame  = InterlockedCompareExchange(&ra_pt_frame, 0, 0);
+   r->thread = GetCurrentThreadId();
+   r->value  = (LONGLONG)value;
+   /* Publishing the timestamp last lets the writer omit partial records. */
+   r->tick   = tick.QuadPart;
+}
+
+void ra_pacing_trace_next_frame(void)
+{
+   if (!ra_pt_is_enabled())
+      return;
+   InterlockedIncrement(&ra_pt_frame);
+   ra_pacing_trace_mark(RA_PT_ITER_BEGIN, 0);
+}
+#endif /* _WIN32 */
+
 int runloop_iterate(void)
 {
    retro_time_t pace_limit_min;
@@ -9722,6 +9855,7 @@ int runloop_iterate(void)
    bool frame_advanced                    = false;
    bool savestate_automatic_enable        = settings->uints.savestate_automatic_interval > 0;
 
+   ra_pacing_trace_next_frame();
    recording_gpu_poll();
    runloop_msg_queue_drain_deferred();
 
@@ -10123,6 +10257,8 @@ int runloop_iterate(void)
    (void)frame_advanced;
 #endif
 
+   ra_pacing_trace_mark(RA_PT_ITER_AFTER_CORE, 0);
+
    /* Increment runtime tick counter after each call to
     * core_run() or run_ahead() */
    runloop_st->core_runtime_usec += runloop_core_runtime_tick(
@@ -10275,6 +10411,7 @@ end:
          frame_advanced);
    AUDIO_FLAGS_CLEAR(audio_st, AUDIO_FLAG_WROTE);
    runloop_st->pace = runloop_pace_sources(pace_facts);
+   ra_pacing_trace_mark(RA_PT_PACE_FACTS, (int64_t)pace_facts);
 
    /* Nothing to present to - a minimised or zero-sized window, a
     * surface the compositor has suspended, a swapchain that could not
@@ -10291,6 +10428,7 @@ end:
       /* One frame of content time, so a window that comes back is
        * noticed within a frame and the core keeps its own rate while
        * hidden. */
+      ra_pacing_trace_mark(RA_PT_NOWINDOW, 0);
       retro_sleep_us((unsigned)runloop_content_frame_time_us(video_st->core_hz));
       return 1;
    }
@@ -10319,6 +10457,10 @@ end:
                : settings->floats.video_refresh_rate);
    }
 
+   ra_pacing_trace_mark(RA_PT_PACE_SOURCES, (int64_t)runloop_st->pace);
+   ra_pacing_trace_mark(RA_PT_CORE_HZ_MILLI,
+         (int64_t)(video_st->core_hz * 1000.0));
+
    /* The low-latency backend releases the next frame: the hold is the
     * driver's signal, taken here where the frame delay would have
     * slept, before the next iteration samples input. The timer's
@@ -10333,11 +10475,13 @@ end:
        * presenter with that frame */
       video_st->driver_pacing_interval_us = runloop_pace_driver_interval(
             runloop_st->pace, pace_limit_min, period);
+      ra_pacing_trace_mark(RA_PT_DRIVER_WAIT_BEGIN, 0);
       if (video_st->poke->driver_pacing_wait(video_st->data,
             runloop_st->driver_pacing_frame_id,
             runloop_st->driver_pacing_next_id + 1,
             (unsigned)(2 * period + 10000)))
       {
+         ra_pacing_trace_mark(RA_PT_DRIVER_WAIT_END, 1);
          uint64_t id                        = ++runloop_st->driver_pacing_next_id;
          runloop_st->driver_pacing_frame_id = id;
          video_st->driver_pacing_id         = id;
@@ -10347,6 +10491,7 @@ end:
                   VIDEO_DRIVER_PACING_MARK_SIMULATION_START);
          goto driver_paced;
       }
+      ra_pacing_trace_mark(RA_PT_DRIVER_WAIT_END, 0);
       runloop_st->driver_pacing_frame_id = 0;
       video_st->driver_pacing_id         = 0;
       runloop_st->pace                  &= ~RUNLOOP_PACE_DRIVER;
@@ -10363,6 +10508,7 @@ end:
                &runloop_st->frame_limit_anchor_ns,
                pace_limit_ns ? pace_limit_ns : (int64_t)frame_limit_min * 1000,
                end_frame_time);
+         ra_pacing_trace_mark(RA_PT_TIMER_REQUEST_US, to_sleep_us);
          if (to_sleep_us > 0)
          {
 #if defined(__EMSCRIPTEN__) && !defined(EMSCRIPTEN_ASYNCIFY) && !defined(PROXY_TO_PTHREAD)
@@ -10386,17 +10532,21 @@ end:
             {
                const retro_time_t asked_until =
                      deadline - runloop_st->frame_limit_margin;
+               ra_pacing_trace_mark(RA_PT_TIMER_WAIT_BEGIN, asked_until);
                retro_sleep_until_us(asked_until);
+               ra_pacing_trace_mark(RA_PT_TIMER_WAIT_END, 0);
                now = cpu_features_get_time_usec();
                runloop_st->frame_limit_margin = runloop_pace_margin_update(
                      runloop_st->frame_limit_margin,
                      now - asked_until, frame_limit_min);
             }
+            ra_pacing_trace_mark(RA_PT_TIMER_SPIN_BEGIN, deadline);
             while (now < deadline)
             {
                retro_cpu_relax();
                now = cpu_features_get_time_usec();
             }
+            ra_pacing_trace_mark(RA_PT_TIMER_SPIN_END, 0);
 #endif
             return 1;
          }
@@ -10407,7 +10557,11 @@ end:
    /* Frame delay. */
    if (     !(input_st->flags & INP_FLAG_NONBLOCKING)
          || (runloop_st->flags & RUNLOOP_FLAG_FASTMOTION))
+   {
+      ra_pacing_trace_mark(RA_PT_FRAME_DELAY_BEGIN, 0);
       video_frame_delay(video_st, settings);
+      ra_pacing_trace_mark(RA_PT_FRAME_DELAY_END, 0);
+   }
 
 driver_paced:
    /* Set paused state after x frames */
@@ -11147,14 +11301,18 @@ bool core_run(void)
        * frame, the video thread's between frames. */
       video_thread_core_context_take();
 #endif
+      ra_pacing_trace_mark(RA_PT_CORE_BEGIN, 0);
       current_core->retro_run();
+      ra_pacing_trace_mark(RA_PT_CORE_END, 0);
 #ifdef HAVE_THREADS
       video_thread_core_context_release();
 #endif
       ran = true;
       if (runloop_st->auto_state_load_pending)
          runloop_st->auto_state_load_core_ran = true;
+      ra_pacing_trace_mark(RA_PT_AUDIO_FRAME_END_BEGIN, 0);
       audio_driver_frame_end();
+      ra_pacing_trace_mark(RA_PT_AUDIO_FRAME_END_END, 0);
    }
 
 #ifdef HAVE_GAME_AI

@@ -40,6 +40,7 @@
 #include <formats/video_hw_frame.h>
 #include "../cores/internal_cores.h"
 #include "video_driver.h"
+#include "../pacing_trace.h"
 #include "video_hdr_metadata.h"
 #include "gfx_media_display.h"
 #if defined(HAVE_X11) && defined(HAVE_XRANDR)
@@ -9044,6 +9045,7 @@ void video_driver_frame(const void *data, unsigned width,
    if (!video_driver_active)
       return;
 
+   ra_pacing_trace_mark(RA_PT_VIDEO_BEGIN, data ? 1 : 0);
    new_time                      = cpu_features_get_time_usec();
    runloop_st->core_run_time     = new_time - runloop_st->core_run_time;
 
@@ -9699,6 +9701,7 @@ void video_driver_frame(const void *data, unsigned width,
  * there instead */
 if (!VIDEO_DRIVER_IS_THREADED_INTERNAL(video_st))
    font_driver_frame_begin();
+      ra_pacing_trace_mark(RA_PT_FRAME_CALLBACK_BEGIN, 0);
       if (frame_cb(
                video_st->data, data, dims,
                video_st->frame_count, (unsigned)pitch,
@@ -9714,6 +9717,7 @@ if (!VIDEO_DRIVER_IS_THREADED_INTERNAL(video_st))
          video_st->main_flags |=  VIDEO_FLAG_ACTIVE;
       else
          video_st->main_flags &= ~VIDEO_FLAG_ACTIVE;
+      ra_pacing_trace_mark(RA_PT_FRAME_CALLBACK_END, 0);
 
 #ifdef HAVE_THREADS
       /* Under the wrapper the video thread is the presenter and
@@ -9849,6 +9853,7 @@ if (!VIDEO_DRIVER_IS_THREADED_INTERNAL(video_st))
    if (video_info.scanline_sync && !video_info.input_driver_nonblock_state)
       video_driver_scanline_after_frame(video_st,
             video_info.frame_time_target, runloop_st->core_run_time);
+   ra_pacing_trace_mark(RA_PT_VIDEO_END, 0);
 }
 
 static void video_driver_reinit_context(settings_t *settings, int flags)

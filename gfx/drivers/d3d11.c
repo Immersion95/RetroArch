@@ -60,6 +60,7 @@
 #include "../../verbosity.h"
 #include "../../configuration.h"
 #include "../../retroarch.h"
+#include "../../pacing_trace.h"
 #include "../../performance_counters.h"
 #include "../../menu/menu_driver.h"
 #ifdef HAVE_REWIND
@@ -5507,7 +5508,9 @@ static void d3d11_present(d3d11_video_t *d3d11, unsigned sync_interval,
       unsigned flags)
 {
    d3d_driver_pacing_present_begin(&d3d11->driver_pacing, d3d11->device);
+   ra_pacing_trace_mark(RA_PT_DXGI_PRESENT_BEGIN, sync_interval);
    DXGIPresent(d3d11->swapChain, sync_interval, flags);
+   ra_pacing_trace_mark(RA_PT_DXGI_PRESENT_END, flags);
    d3d_driver_pacing_present_end(&d3d11->driver_pacing, d3d11->device);
 }
 
