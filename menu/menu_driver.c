@@ -50,6 +50,7 @@
 #include "../audio/audio_driver.h"
 
 #include "menu_driver.h"
+#include "../frame_trace.h"
 #include "menu_bind_trigger.h"
 #include "menu_dirwalk.h"
 #include "menu_cbs.h"
@@ -7385,6 +7386,8 @@ void retroarch_menu_running(void)
       if (menu->driver_ctx && menu->driver_ctx->toggle)
          menu->driver_ctx->toggle(menu->userdata, true);
 
+      if (!(menu_st->flags & MENU_ST_FLAG_ALIVE))
+         ra_frame_trace_mark(RA_FT_MENU_ENTER, 1);
       menu_st->flags |= MENU_ST_FLAG_ALIVE;
       menu_driver_drop_accept(true);
       menu_driver_toggle(
@@ -7457,6 +7460,8 @@ void retroarch_menu_running_finished(bool quit)
       if (menu->driver_ctx && menu->driver_ctx->toggle)
          menu->driver_ctx->toggle(menu->userdata, false);
 
+      if (menu_st->flags & MENU_ST_FLAG_ALIVE)
+         ra_frame_trace_mark(RA_FT_MENU_EXIT, 0);
       menu_st->flags &= ~MENU_ST_FLAG_ALIVE;
       menu_driver_drop_accept(false);
       /* Ramp the core's first frames back up. Not when quitting - nothing

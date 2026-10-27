@@ -45,6 +45,7 @@
 #endif
 
 #include "input_driver.h"
+#include "../frame_trace.h"
 #ifdef HAVE_THREADS
 #include "input_key_lane.h"
 #endif
@@ -15777,6 +15778,8 @@ void input_driver_poll(void)
          > MAX_USERS) ? MAX_USERS
          : (uint8_t)settings->uints.input_max_users;
 
+   ra_frame_trace_mark(RA_FT_INPUT_BEGIN, 0);
+
 #ifdef HAVE_THREADS
    /* a restart of the joypad driver that another thread asked for:
     * before anything of it is polled or read */
@@ -15792,19 +15795,29 @@ void input_driver_poll(void)
 #ifdef HAVE_HID
    /* the source beside the joypad driver first: what it finds decides
     * whether the driver is reached through input_beside_joypad */
+   ra_frame_trace_mark(RA_FT_INPUT_BESIDE_BEGIN, 0);
    input_beside_poll(input_st);
+   ra_frame_trace_mark(RA_FT_INPUT_BESIDE_END, 0);
    joypad = input_st->primary_joypad;
 #endif
 
    if (joypad && joypad->poll)
+   {
+      ra_frame_trace_mark(RA_FT_JOYPAD_BEGIN, 0);
       joypad->poll();
+      ra_frame_trace_mark(RA_FT_JOYPAD_END, 0);
+   }
    input_player_lights(joypad, settings->uints.input_joypad_index,
          max_users);
    /* a driver that keeps its mice publishes them in its poll; one that
     * does not is asked for them, as before */
    input_pointer_frames_clear();
    if (input && input->poll)
+   {
+      ra_frame_trace_mark(RA_FT_INPUT_DEVICE_BEGIN, 0);
       input->poll(input_st->current_data);
+      ra_frame_trace_mark(RA_FT_INPUT_DEVICE_END, 0);
+   }
 #ifdef HAVE_OPENXR
    input_openxr_poll(max_users, settings->uints.video_openxr_controllers,
          settings->uints.video_openxr_laser, input_axis_threshold);
@@ -15960,6 +15973,7 @@ void input_driver_poll(void)
          input_st->turbo_btns.frame_enable[i] = 0;
          input_st->hold_btns.frame_enable[i]  = 0;
       }
+      ra_frame_trace_mark(RA_FT_INPUT_END, 0);
       return;
    }
 
@@ -16556,6 +16570,7 @@ void input_driver_poll(void)
       if (!any)
          input_st->core_hold_armed = false;
    }
+   ra_frame_trace_mark(RA_FT_INPUT_END, 0);
 }
 
 /* The quarter turns to turn a core's directions by: the setting, or

@@ -32,6 +32,7 @@
 #endif
 
 #include "audio_driver.h"
+#include "../frame_trace.h"
 #include "../defaults.h"
 #include "audio_stretch.h"
 #include "audio_speed_lpf.h"
@@ -7581,6 +7582,7 @@ static void audio_driver_sample_accum_flush(audio_driver_state_t *audio_st)
     * both, the runloop's own flag word only for the first. */
    int snap                        = retro_atomic_load_acquire_int(
          &audio_st->runloop_snapshot);
+   ra_frame_trace_mark(RA_FT_AUDIO_ACCUM_BEGIN, (int64_t)(audio_st->data_ptr / 2));
    audio_driver_record_push(audio_st, audio_st->sample_accum,
          audio_st->data_ptr / 2, 2, AUDIO_LAYOUT_STEREO, false);
 
@@ -7597,6 +7599,7 @@ static void audio_driver_sample_accum_flush(audio_driver_state_t *audio_st)
             (snap & AUDIO_SNAP_FASTMOTION) ? true : false, true);
 
    audio_st->data_ptr = 0;
+   ra_frame_trace_mark(RA_FT_AUDIO_ACCUM_END, 0);
 }
 
 void audio_driver_sample(int16_t left, int16_t right)
@@ -7669,8 +7672,13 @@ size_t audio_driver_sample_batch(const int16_t *data, size_t frames)
    int aflags                     = AUDIO_FLAGS_GET(audio_st);
    float slowmotion_ratio;
 
+   ra_frame_trace_mark(RA_FT_AUDIO_BATCH_BEGIN, (int64_t)frames);
+
    if ((aflags & AUDIO_FLAG_SUSPENDED) || (frames < 1))
+   {
+      ra_frame_trace_mark(RA_FT_AUDIO_BATCH_END, (int64_t)frames);
       return frames;
+   }
 
    runloop_flags                  = (uint32_t)retro_atomic_load_acquire_int(
          &audio_st->runloop_snapshot);
@@ -7712,6 +7720,7 @@ size_t audio_driver_sample_batch(const int16_t *data, size_t frames)
       data             += frames_to_write << 1;
    } while (frames_remaining > 0);
 
+   ra_frame_trace_mark(RA_FT_AUDIO_BATCH_END, (int64_t)frames);
    return frames;
 }
 

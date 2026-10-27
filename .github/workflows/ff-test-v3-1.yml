@@ -1,0 +1,71 @@
+name: RetroArch FF test V3.1 (Windows x64)
+
+on:
+  push:
+    branches: ['fix/ff-audio-test-v3-1']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ff-test-v3-1-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows-x64:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 2
+      - name: Set up MSYS2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+      - name: Install build packages
+        shell: msys2 {0}
+        run: |
+          p=$MINGW_PACKAGE_PREFIX
+          pkgs="base-devel git $p-gettext $p-gobject-introspection $p-graphite2 $p-p11-kit $p-qt6-base $p-x264 $p-cc"
+          for i in 1 2 3 4 5; do
+            pacman -S --noconfirm --needed $pkgs && exit 0
+            [ "$i" = 5 ] && break
+            echo "Package install failed; retrying ($i/5)"
+            sed -i -e '/^#*ParallelDownloads/d' -e '/^\[options\]/a ParallelDownloads = 1' /etc/pacman.conf
+            for m in /etc/pacman.d/mirrorlist.*; do
+              awk '/^Server/ && !s { s = $0; next } { print } END { if (s) print s }' "$m" > "$m.tmp" && mv "$m.tmp" "$m"
+            done
+            sleep $((30 * i))
+          done
+          exit 1
+      - name: Build diagnostic
+        shell: msys2 {0}
+        run: |
+          set -eu
+          ./configure
+          make -j"$(nproc)" CPPFLAGS="${CPPFLAGS:-} -DRA_FRAME_DIAGNOSTIC_V3_1" info all
+      - name: Package executable and test launchers
+        shell: msys2 {0}
+        run: |
+          set -eu
+          mkdir -p dist
+          cp retroarch.exe dist/retroarch_ff_test_v3_1.exe
+          ldd retroarch.exe | grep "$MINGW_PREFIX" | awk '{print $3}' | xargs -I {} cp {} dist/ || true
+          cp tools/ff_test_v3_1/*.bat tools/ff_test_v3_1/*.ps1 tools/ff_test_v3_1/LIRE_TESTS.txt dist/
+          {
+            echo "Build: RetroArch FF test V3.1, Windows x64"
+            echo "Source base: e8928377d1934208a5b03059b57674e002a8c61a"
+            echo "Build commit: $(git rev-parse HEAD)"
+            echo "Parent commit: $(git rev-parse HEAD^)"
+            echo "Workflow run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            sha256sum dist/retroarch_ff_test_v3_1.exe
+          } > dist/build-info.txt
+      - name: Upload Windows x64 build
+        uses: actions/upload-artifact@v4
+        with:
+          name: RetroArch_FF_Test_V3_1_Windows_x64
+          path: dist/

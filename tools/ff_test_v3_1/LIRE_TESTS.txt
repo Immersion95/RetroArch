@@ -1,0 +1,49 @@
+TEST FAST-FORWARD V3.1 - UN SEUL BUILD WINDOWS X64
+
+Les tests 1 et 2 utilisent le meme executable et gardent les reglages
+habituels du jeu, du core et de la video. Seule la sortie audio change.
+Ce build mesure le probleme ; il ne contient pas de correction de pacing.
+
+Utiliser avec les cores, assets et configurations de ton installation
+RetroArch habituelle. L'executable de test s'appelle retroarch_ff_test_v3_1.exe.
+Tu peux le placer a cote de ton executable habituel, avec les DLL du build.
+Les BAT et VERIFIER_CAPTURE.ps1 doivent rester ensemble ; ils peuvent etre
+places a cote de cet executable, ou le demanderont au lancement.
+
+1. TEST_1_AUDIO_ON.bat : sortie audio active.
+2. TEST_2_AUDIO_OFF.bat : sortie audio desactivee avec audio_enable=false.
+   Ce n'est pas le bouton Muet : le pilote doit etre inactif dans la capture.
+
+Faire les deux essais dans le meme jeu, le meme core et le meme renderer.
+Pour commencer, prendre le cas AMD/D3D11 ou le menu retablit la fluidite,
+avec un core autre que PCEE2. PCEE2 reste a examiner separement.
+
+Dans CHAQUE essai :
+- Charger le jeu, se placer dans un passage repetitif et fluide.
+- Si necessaire, ouvrir/fermer le menu avant la capture pour repartir fluide.
+- Presser F12 : debut de la capture (environ 30 secondes au maximum).
+- Jouer 4 secondes normalement.
+- Faire 1 a 2 secondes d'avance rapide et relacher.
+- Jouer 5 secondes sans ouvrir le menu.
+- Ouvrir le menu 1 a 2 secondes, fermer, puis jouer 5 secondes.
+- Quitter RetroArch normalement.
+- Le lanceur demande trois observations courtes, verifie la capture et cree
+  un ZIP dans captures_ff_v3_1. Envoyer les ZIP des essais 1 et 2.
+
+Une capture marquee invalide est conservee avec son journal et son motif.
+La verification controle le build V3_1, l'etat audio sur toutes les frames,
+les marqueurs fast-forward/menu et les pertes d'evenements.
+Ne pas changer de core, de renderer ou de reglage audio pendant une capture.
+Ne pas sauvegarder de configuration ou d'override pendant les essais.
+Le lanceur desactive la sauvegarde automatique ; ton CFG reste celui d'avant.
+
+CONTROLE FACULTATIF, APRES LES DEUX PREMIERS ESSAIS :
+TEST_3_AUDIO_OFF_SANS_FRAMESKIP.bat utilise le meme executable, audio OFF,
+avec fastforward_frameskip=false. Il permet d'examiner le chemin de saut
+d'images modifie le 8 octobre. Ce n'est pas un retour a une ancienne version.
+Pas besoin de recompiler pour ce controle. Ne le faire que si les deux
+premiers essais restent saccades apres l'avance rapide.
+
+Aucune modification de Windows ou des pilotes graphiques.
+La capture utilise de la memoire et est ecrite a la sortie normale.
+La mesure ajoute un petit cout ; elle ne mesure pas l'affichage physique.

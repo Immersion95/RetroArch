@@ -54,6 +54,7 @@
 #include <stdlib.h>
 #include <stdarg.h>
 #include <stdint.h>
+#include <inttypes.h>
 #include <string.h>
 #include <ctype.h>
 #include <math.h>
@@ -137,6 +138,7 @@ bool android_get_vfs_authorized_locations(
 
 #include "runtime_file.h"
 #include "runloop.h"
+#include "frame_trace.h"
 #include "camera/camera_driver.h"
 #include "location_driver.h"
 #include "record/record_driver.h"
@@ -5545,6 +5547,8 @@ static void runloop_apply_fastmotion_override(runloop_state_t *runloop_st,
          runloop_st->fastforward_after_frames = 1;
 
       driver_set_nonblock_state();
+      ra_frame_trace_mark(RA_FT_FAST_FORWARD,
+            (runloop_st->flags & RUNLOOP_FLAG_FASTMOTION) ? 1 : 0);
 
       /* Reset frame time counter when toggling
        * fast-forward off, if required */
@@ -5601,6 +5605,7 @@ static void runloop_apply_fastmotion(bool enabled)
       AUDIO_FLAGS_CLEAR(audio_st, AUDIO_FLAG_MUTED);
 
    driver_set_nonblock_state();
+   ra_frame_trace_mark(RA_FT_FAST_FORWARD, enabled ? 1 : 0);
 
    if (!enabled && settings->bools.frame_time_counter_auto_reset)
       video_st->frame_time_count = 0;
@@ -6401,6 +6406,289 @@ static bool core_verify_api_version(runloop_state_t *runloop_st)
    return true;
 }
 
+#if defined(RA_FRAME_DIAGNOSTIC_V3_1) && defined(_WIN32) \
+      && !defined(_XBOX) && !defined(__WINRT__)
+#define RA_FT_CAPACITY 262144L
+typedef BOOL (WINAPI *ra_ft_cycles_t)(HANDLE, ULONGLONG*);
+
+struct ra_ft_record
+{
+   int64_t tick;
+   int64_t value;
+   uint64_t cycles;
+   LONG frame;
+   DWORD thread;
+   LONG ready;
+   unsigned event;
+};
+
+/* Process-lifetime storage also covers late worker exits. */
+static struct ra_ft_record *ra_ft_buffer;
+static ra_ft_cycles_t ra_ft_cycles;
+static LARGE_INTEGER ra_ft_frequency;
+static LARGE_INTEGER ra_ft_started_at;
+static volatile LONG ra_ft_state;
+static volatile LONG ra_ft_written;
+static volatile LONG ra_ft_frame;
+static bool ra_ft_initialized;
+static bool ra_ft_started;
+static char ra_ft_path[PATH_MAX_LENGTH];
+static char ra_ft_core[NAME_MAX_LENGTH];
+static char ra_ft_core_version[64];
+static char ra_ft_video[64];
+static char ra_ft_input[64];
+static char ra_ft_joypad[64];
+static char ra_ft_audio[64];
+static char ra_ft_test_case[64];
+static int ra_ft_audio_requested = -1;
+static int ra_ft_frameskip_requested = -1;
+static int ra_ft_audio_flags_at_start;
+static bool ra_ft_audio_enabled_at_start;
+static bool ra_ft_frameskip_at_start;
+
+static int ra_ft_bool_env(const char *name)
+{
+   const char *value = getenv(name);
+   if (value && strcmp(value, "0") == 0)
+      return 0;
+   if (value && strcmp(value, "1") == 0)
+      return 1;
+   return -1;
+}
+
+static void ra_frame_trace_test_settings(settings_t *settings)
+{
+   const char *enabled = getenv("RA_FRAME_TRACE");
+   int audio           = ra_ft_bool_env("RA_FF_TEST_AUDIO");
+   int skip            = ra_ft_bool_env("RA_FF_TEST_FRAMESKIP");
+   if (!enabled || strcmp(enabled, "1") != 0)
+      return;
+   if (audio >= 0)
+      settings->bools.audio_enable = audio != 0;
+   if (skip >= 0)
+      settings->bools.fastforward_frameskip = skip != 0;
+   if (audio >= 0 || skip >= 0)
+      settings->bools.config_save_on_exit = false;
+}
+
+static const char *ra_ft_event_name(unsigned event)
+{
+   static const char *const names[] = {
+      "FRAME_BEGIN", "CORE_BEGIN", "CORE_END", "CORE_HZ_MILLI",
+      "VIDEO_BEGIN", "VIDEO_END", "INPUT_BEGIN", "INPUT_END",
+      "JOYPAD_BEGIN", "JOYPAD_END", "INPUT_DEVICE_BEGIN",
+      "INPUT_DEVICE_END", "INPUT_BESIDE_BEGIN", "INPUT_BESIDE_END",
+      "AUDIO_BATCH_BEGIN", "AUDIO_BATCH_END", "AUDIO_ACCUM_BEGIN",
+      "AUDIO_ACCUM_END", "INPUT_STATE_SLOW", "FRAME_LIMIT_US",
+      "FAST_FORWARD", "MENU_ENTER", "MENU_EXIT",
+      "AUDIO_FRAME_END_BEGIN", "AUDIO_FRAME_END_END"
+   };
+   return event < ARRAY_SIZE(names) ? names[event] : "UNKNOWN";
+}
+
+static void ra_ft_save(void)
+{
+   LONG i;
+   LONG written = InterlockedCompareExchange(&ra_ft_written, 0, 0);
+   FILE *fp;
+   const char *git_version = "unavailable";
+#ifdef HAVE_GIT_VERSION
+   git_version = retroarch_git_version;
+#endif
+   InterlockedExchange(&ra_ft_state, 3);
+   fp = fopen(ra_ft_path, "wb");
+   if (!fp)
+   {
+      fprintf(stderr, "[FF test V3_1] Cannot write %s\n", ra_ft_path);
+      return;
+   }
+   fprintf(fp, "# build=ff_audio_test_v3_1\n");
+   fprintf(fp, "# capture_started=%d\n", ra_ft_started ? 1 : 0);
+   fprintf(fp, "# source_base=e8928377d1934208a5b03059b57674e002a8c61a\n");
+   fprintf(fp, "# git_version=%s\n# test_case=%s\n",
+         git_version, ra_ft_test_case);
+   fprintf(fp, "# audio_requested=%d\n# frameskip_requested=%d\n",
+         ra_ft_audio_requested, ra_ft_frameskip_requested);
+   fprintf(fp, "# audio_enabled_at_start=%d\n# audio_active_at_start=%d\n"
+         "# audio_started_at_start=%d\n# audio_nonblocking_at_start=%d\n",
+         ra_ft_audio_enabled_at_start ? 1 : 0,
+         (ra_ft_audio_flags_at_start & AUDIO_FLAG_ACTIVE) ? 1 : 0,
+         (ra_ft_audio_flags_at_start & AUDIO_FLAG_STARTED) ? 1 : 0,
+         (ra_ft_audio_flags_at_start & AUDIO_FLAG_NONBLOCK) ? 1 : 0);
+   fprintf(fp, "# active_audio=%s\n# fastforward_frameskip_at_start=%d\n",
+         ra_ft_audio, ra_ft_frameskip_at_start ? 1 : 0);
+   fprintf(fp, "# qpc_frequency_hz=%" PRId64 "\n",
+         (int64_t)ra_ft_frequency.QuadPart);
+   fprintf(fp, "# cycle_counter_available=%d\n", ra_ft_cycles ? 1 : 0);
+   fprintf(fp, "# core=%s\n# core_version=%s\n", ra_ft_core, ra_ft_core_version);
+   fprintf(fp, "# active_video=%s\n# active_input=%s\n# active_joypad=%s\n",
+         ra_ft_video, ra_ft_input, ra_ft_joypad);
+   fprintf(fp, "# buffer_capacity=%ld\n# events_lost=%ld\n",
+         (long)RA_FT_CAPACITY,
+         written > RA_FT_CAPACITY ? (long)(written - RA_FT_CAPACITY) : 0L);
+   fprintf(fp, "sequence,frame,thread_id,event,qpc_ticks,value,thread_cycles\n");
+   if (written > RA_FT_CAPACITY)
+      written = RA_FT_CAPACITY;
+   for (i = 0; i < written; i++)
+   {
+      struct ra_ft_record *r = &ra_ft_buffer[i];
+      if (!InterlockedCompareExchange(&r->ready, 0, 0))
+         continue;
+      fprintf(fp, "%ld,%ld,%lu,%s,%" PRId64 ",%" PRId64 ",%" PRIu64 "\n",
+            (long)i, (long)r->frame, (unsigned long)r->thread,
+            ra_ft_event_name(r->event), r->tick, r->value, r->cycles);
+   }
+   fclose(fp);
+   fprintf(stderr, "[FF test V3_1] Wrote %ld events to %s\n",
+         (long)written, ra_ft_path);
+}
+
+static void ra_frame_trace_init(void)
+{
+   LONG i;
+   const char *enabled;
+   const char *path;
+   HMODULE kernel;
+   if (ra_ft_initialized)
+      return;
+   ra_ft_initialized = true;
+   enabled = getenv("RA_FRAME_TRACE");
+   if (!enabled || strcmp(enabled, "1") != 0)
+      return;
+   if (!QueryPerformanceFrequency(&ra_ft_frequency)
+         || ra_ft_frequency.QuadPart <= 0)
+      return;
+   ra_ft_buffer = (struct ra_ft_record*)calloc(
+         RA_FT_CAPACITY, sizeof(*ra_ft_buffer));
+   if (!ra_ft_buffer)
+      return;
+   if (atexit(ra_ft_save) != 0)
+   {
+      free(ra_ft_buffer);
+      ra_ft_buffer = NULL;
+      return;
+   }
+   /* Fault in capture pages before gameplay. */
+   for (i = 0; i < RA_FT_CAPACITY; i += 64)
+      InterlockedExchange(&ra_ft_buffer[i].ready, 0);
+   path = getenv("RA_FRAME_TRACE_FILE");
+   strlcpy(ra_ft_path, path && *path ? path : "retroarch_frame_trace.csv",
+         sizeof(ra_ft_path));
+   ra_ft_audio_requested    = ra_ft_bool_env("RA_FF_TEST_AUDIO");
+   ra_ft_frameskip_requested = ra_ft_bool_env("RA_FF_TEST_FRAMESKIP");
+   path = getenv("RA_FF_TEST_CASE");
+   strlcpy(ra_ft_test_case, path && *path ? path : "manual",
+         sizeof(ra_ft_test_case));
+   kernel = GetModuleHandleA("kernel32.dll");
+   ra_ft_cycles = kernel ? (ra_ft_cycles_t)GetProcAddress(kernel,
+         "QueryThreadCycleTime") : NULL;
+   InterlockedExchange(&ra_ft_state, 1);
+   RARCH_LOG("[FF test V3_1] Ready: press F12 in game;"
+         " quit normally to save the capture.\n");
+}
+
+void ra_frame_trace_mark(enum ra_frame_trace_event event, int64_t value)
+{
+   LONG slot;
+   LARGE_INTEGER now;
+   ULONGLONG cycles = 0;
+   struct ra_ft_record *r;
+   if (InterlockedCompareExchange(&ra_ft_state, 0, 0) != 2)
+      return;
+   QueryPerformanceCounter(&now);
+   if (ra_ft_cycles && !ra_ft_cycles(GetCurrentThread(), &cycles))
+      cycles = 0;
+   slot = InterlockedIncrement(&ra_ft_written) - 1;
+   if (slot >= RA_FT_CAPACITY)
+      return;
+   r         = &ra_ft_buffer[slot];
+   r->tick   = now.QuadPart;
+   r->value  = value;
+   r->cycles = cycles;
+   r->frame  = InterlockedCompareExchange(&ra_ft_frame, 0, 0);
+   r->thread = GetCurrentThreadId();
+   r->event  = (unsigned)event;
+   InterlockedExchange(&r->ready, 1);
+}
+
+static void ra_frame_trace_begin(void)
+{
+   LARGE_INTEGER now;
+   LONG state = InterlockedCompareExchange(&ra_ft_state, 0, 0);
+   video_driver_state_t *video_st;
+   audio_driver_state_t *audio_st;
+   input_driver_state_t *input_st;
+   settings_t *settings;
+   int audio_flags;
+   unsigned flags = 0;
+   if (state != 1 && state != 2)
+      return;
+   video_st = video_state_get_ptr();
+   audio_st = audio_state_get_ptr();
+   input_st = input_state_get_ptr();
+   audio_flags = AUDIO_FLAGS_GET(audio_st);
+   settings = config_get_ptr();
+   QueryPerformanceCounter(&now);
+   if (state == 1)
+   {
+      const char *video = video_driver_get_ident();
+      const char *audio = audio_driver_get_ident();
+      if (!(runloop_state.flags & RUNLOOP_FLAG_FOCUSED)
+            || !(GetAsyncKeyState(VK_F12) & 0x8000))
+         return;
+      strlcpy(ra_ft_core, runloop_state.current_library_name, sizeof(ra_ft_core));
+      strlcpy(ra_ft_core_version, runloop_state.current_library_version,
+            sizeof(ra_ft_core_version));
+      strlcpy(ra_ft_video, video ? video : "unknown", sizeof(ra_ft_video));
+      strlcpy(ra_ft_input, input_st->current_driver
+            ? ((const input_driver_t*)input_st->current_driver)->ident : "none", sizeof(ra_ft_input));
+      strlcpy(ra_ft_joypad, input_st->primary_joypad
+            ? input_st->primary_joypad->ident : "none", sizeof(ra_ft_joypad));
+      strlcpy(ra_ft_audio, audio ? audio : "none", sizeof(ra_ft_audio));
+      ra_ft_audio_flags_at_start = audio_flags;
+      ra_ft_audio_enabled_at_start = settings->bools.audio_enable;
+      ra_ft_frameskip_at_start = settings->bools.fastforward_frameskip;
+      ra_ft_started_at = now;
+      ra_ft_started    = true;
+      InterlockedExchange(&ra_ft_state, 2);
+   }
+   else if (now.QuadPart - ra_ft_started_at.QuadPart
+         >= ra_ft_frequency.QuadPart * 30)
+   {
+      InterlockedExchange(&ra_ft_state, 3);
+      return;
+   }
+   if (settings->bools.vrr_runloop_enable)             flags |= 1;
+   if (settings->bools.video_vsync)                    flags |= 2;
+   if (runloop_state.flags & RUNLOOP_FLAG_FASTMOTION)  flags |= 4;
+   if (settings->bools.video_threaded)                 flags |= 8;
+   if (settings->bools.video_scanline_sync)            flags |= 16;
+   if (runloop_state.flags & RUNLOOP_FLAG_PAUSED)      flags |= 32;
+   if (settings->uints.video_driver_pacing)            flags |= 64;
+   if (settings->bools.audio_enable)                   flags |= 128;
+   if (audio_flags & AUDIO_FLAG_ACTIVE)                flags |= 256;
+   if (audio_flags & AUDIO_FLAG_STARTED)               flags |= 512;
+   if (audio_flags & AUDIO_FLAG_NONBLOCK)              flags |= 1024;
+   if (input_st->flags & INP_FLAG_NONBLOCKING)          flags |= 2048;
+#ifdef HAVE_MENU
+   if (menu_state_get_ptr()->flags & MENU_ST_FLAG_ALIVE) flags |= 4096;
+#endif
+   if (audio_st->mute_enable || (audio_flags & AUDIO_FLAG_MUTED)) flags |= 8192;
+   if (settings->bools.fastforward_frameskip)           flags |= 16384;
+   InterlockedIncrement(&ra_ft_frame);
+   ra_frame_trace_mark(RA_FT_FRAME_BEGIN, (int64_t)flags);
+   ra_frame_trace_mark(RA_FT_CORE_HZ_MILLI,
+         (int64_t)(video_st->core_hz * 1000.0));
+   ra_frame_trace_mark(RA_FT_FRAME_LIMIT_US,
+         (int64_t)runloop_state.frame_limit_minimum_time);
+}
+#else
+#define ra_frame_trace_init() ((void)0)
+#define ra_frame_trace_begin() ((void)0)
+#define ra_frame_trace_test_settings(settings) ((void)0)
+#endif
+
+
 /* The poll mode in force: the core's override if it has set one, the
  * user's setting otherwise. */
 static INLINE enum poll_type core_poll_type_current(void)
@@ -6475,12 +6763,54 @@ static void core_input_state_poll_maybe(void)
  * Initializes libretro callbacks, and binds the libretro callbacks
  * to default callback functions.
  **/
+#if defined(RA_FRAME_DIAGNOSTIC_V3_1) && defined(_WIN32) \
+      && !defined(_XBOX) && !defined(__WINRT__)
+static void ra_frame_trace_video_cb(const void *data, unsigned width,
+      unsigned height, size_t pitch)
+{
+   ra_frame_trace_mark(RA_FT_VIDEO_BEGIN,
+         data == RETRO_HW_FRAME_BUFFER_VALID ? 2 : data ? 1 : 0);
+   video_driver_frame(data, width, height, pitch);
+   ra_frame_trace_mark(RA_FT_VIDEO_END, 0);
+}
+
+static int16_t ra_frame_trace_state_cb(unsigned port, unsigned device,
+      unsigned idx, unsigned id)
+{
+   LARGE_INTEGER begin, end;
+   int16_t result;
+   bool recording = InterlockedCompareExchange(&ra_ft_state, 0, 0) == 2;
+   if (recording)
+      QueryPerformanceCounter(&begin);
+   result = core_input_state_cb(port, device, idx, id);
+   if (recording)
+   {
+      QueryPerformanceCounter(&end);
+      if (end.QuadPart - begin.QuadPart >= ra_ft_frequency.QuadPart / 4000)
+         ra_frame_trace_mark(RA_FT_INPUT_STATE_SLOW,
+               end.QuadPart - begin.QuadPart);
+   }
+   return result;
+}
+#endif
+
 static void core_init_libretro_cbs(runloop_state_t *runloop_st,
       struct retro_callbacks *cbs)
 {
    retro_input_state_t state_cb = core_input_state_cb;
+   retro_video_refresh_t frame_cb = video_driver_frame;
 
-   runloop_st->current_core.retro_set_video_refresh(video_driver_frame);
+   ra_frame_trace_init();
+#if defined(RA_FRAME_DIAGNOSTIC_V3_1) && defined(_WIN32) \
+      && !defined(_XBOX) && !defined(__WINRT__)
+   if (ra_ft_buffer)
+   {
+      state_cb = ra_frame_trace_state_cb;
+      frame_cb = ra_frame_trace_video_cb;
+   }
+#endif
+
+   runloop_st->current_core.retro_set_video_refresh(frame_cb);
    runloop_st->current_core.retro_set_audio_sample(audio_driver_sample);
    runloop_st->current_core.retro_set_audio_sample_batch(audio_driver_sample_batch);
    runloop_st->current_core.retro_set_input_state(state_cb);
@@ -6669,6 +6999,8 @@ bool runloop_event_init_core(
    if (auto_overrides_enable)
       config_load_override(&runloop_st->system);
 #endif
+
+   ra_frame_trace_test_settings(settings);
 
    /* Cannot access these settings-related parameters
     * until *after* config overrides have been loaded */
@@ -10661,8 +10993,19 @@ bool core_set_default_callbacks(void *data)
 {
    struct retro_callbacks *cbs  = (struct retro_callbacks*)data;
    retro_input_state_t state_cb = core_input_state_cb;
+   retro_video_refresh_t frame_cb = video_driver_frame;
 
-   cbs->frame_cb                = video_driver_frame;
+   ra_frame_trace_init();
+#if defined(RA_FRAME_DIAGNOSTIC_V3_1) && defined(_WIN32) \
+      && !defined(_XBOX) && !defined(__WINRT__)
+   if (ra_ft_buffer)
+   {
+      state_cb = ra_frame_trace_state_cb;
+      frame_cb = ra_frame_trace_video_cb;
+   }
+#endif
+
+   cbs->frame_cb                = frame_cb;
    cbs->sample_cb               = audio_driver_sample;
    cbs->sample_batch_cb         = audio_driver_sample_batch;
    cbs->state_cb                = state_cb;
@@ -11123,6 +11466,8 @@ bool core_run(void)
    }
 #endif
 
+   ra_frame_trace_begin();
+
    /* The flag says whether this frame's poll has happened. Early
     * polling polls here; normal and late start the frame without it,
     * and input_poll or the first input_state sets it. */
@@ -11148,14 +11493,18 @@ bool core_run(void)
        * frame, the video thread's between frames. */
       video_thread_core_context_take();
 #endif
+      ra_frame_trace_mark(RA_FT_CORE_BEGIN, 0);
       current_core->retro_run();
+      ra_frame_trace_mark(RA_FT_CORE_END, 0);
 #ifdef HAVE_THREADS
       video_thread_core_context_release();
 #endif
       ran = true;
       if (runloop_st->auto_state_load_pending)
          runloop_st->auto_state_load_core_ran = true;
+      ra_frame_trace_mark(RA_FT_AUDIO_FRAME_END_BEGIN, 0);
       audio_driver_frame_end();
+      ra_frame_trace_mark(RA_FT_AUDIO_FRAME_END_END, 0);
       recording_start_frame();
    }
 
